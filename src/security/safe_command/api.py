@@ -1,3 +1,4 @@
+import subprocess
 import shlex
 from re import compile as re_compile
 from pathlib import Path
@@ -5,21 +6,26 @@ from glob import iglob
 from os import getenv, get_exec_path, access, X_OK
 from os.path import expanduser, expandvars
 from shutil import which
-from subprocess import CompletedProcess
-from typing import Union, Optional, List, Tuple, Set, FrozenSet, Sequence, Callable, Iterator
+from typing import Union, Optional, Dict, List, Tuple, Set, FrozenSet, Sequence, Callable, Iterator, Any
 from security.exceptions import SecurityException
 
-ValidRestrictions = Optional[Union[FrozenSet[str], Sequence[str]]]
+if subprocess._mswindows: # type: ignore
+    from warnings import warn
+    warn(RuntimeWarning("SafeCommand not yet fully supported on Windows. Only use if you know what you are doing."))
+
+ValidConfigVal = Union[FrozenSet[str], Set[str]]
+ValidConfig = Dict[str, ValidConfigVal]
+ValidRestrictions = Optional[Union[ValidConfigVal , Sequence[str]]]
 ValidCommand = Union[str, List[str]]
 
-DEFAULT_CHECKS = frozenset(
+DEFAULT_RESTRICTIONS = frozenset(
     ("PREVENT_COMMAND_CHAINING",
      "PREVENT_ARGUMENTS_TARGETING_SENSITIVE_FILES",
      "PREVENT_COMMON_EXPLOIT_EXECUTABLES",
      )
 )
 
-SENSITIVE_FILE_PATHS = frozenset(
+DEFAULT_SENSITIVE_FILE_PATHS = frozenset(
     (
         "/etc/passwd",
         "/etc/shadow",
@@ -33,43 +39,165 @@ SENSITIVE_FILE_PATHS = frozenset(
     )
 )
 
-BANNED_EXECUTABLES = frozenset(
+DEFAULT_BANNED_COMMON_EXPLOIT_EXECUTABLES = frozenset(
     ("nc", "netcat", "ncat", "curl", "wget", "dpkg", "rpm"))
-BANNED_PATHTYPES = frozenset(
+DEFAULT_BANNED_PATHTYPES = frozenset(
     ("mount", "symlink", "block_device", "char_device", "fifo", "socket"))
-BANNED_OWNERS = frozenset(("root", "admin", "wheel", "sudo"))
-BANNED_GROUPS = frozenset(("root", "admin", "wheel", "sudo"))
-BANNED_COMMAND_CHAINING_SEPARATORS = frozenset(("&", ";", "|", "\n"))
-BANNED_COMMAND_AND_PROCESS_SUBSTITUTION_OPERATORS = frozenset(
+DEFAULT_BANNED_OWNERS = frozenset(("root", "admin", "wheel", "sudo"))
+DEFAULT_BANNED_GROUPS = DEFAULT_BANNED_OWNERS
+DEFAULT_BANNED_COMMAND_CHAINING_SEPARATORS = frozenset(("&", ";", "|", "\n"))
+DEFAULT_BANNED_COMMAND_AND_PROCESS_SUBSTITUTION_OPERATORS = frozenset(
     ("$(", "`", "<(", ">("))
-BANNED_COMMAND_CHAINING_EXECUTABLES = frozenset((
+DEFAULT_BANNED_COMMAND_CHAINING_EXECUTABLES = frozenset((
     "eval", "exec", "-exec", "env", "source", "sudo", "su", "gosu", "sudoedit",
     "xargs", "awk", "perl", "python", "ruby", "php", "lua", "sqlplus",
     "expect", "screen", "tmux", "byobu", "byobu-ugraph", "time",
     "nohup", "at", "batch", "anacron", "cron", "crontab", "systemctl", "service", "init", "telinit",
     "systemd", "systemd-run"
 ))
-COMMON_SHELLS = frozenset(("sh", "bash", "zsh", "csh", "rsh", "tcsh", "tclsh", "ksh", "dash", "ash",
-                          "jsh", "jcsh", "mksh", "wsh", "fish", "busybox", "powershell", "pwsh", "pwsh-preview", "pwsh-lts"))
+DEFAULT_SHELLS = frozenset(("sh", "bash", "zsh", "csh", "rsh", "tcsh", "tclsh", "ksh", "dash", "ash",
+                            "jsh", "jcsh", "mksh", "wsh", "fish", "busybox", "powershell", "pwsh", "pwsh-preview", "pwsh-lts"))
 
-ALLOWED_SHELL_EXPANSION_OPERATORS = frozenset(('-', '=', '?', '+'))
-BANNED_SHELL_EXPANSION_OPERATORS = frozenset(
+DEFAULT_ALLOWED_SHELL_EXPANSION_OPERATORS = frozenset(('-', '=', '?', '+'))
+DEFAULT_BANNED_SHELL_EXPANSION_OPERATORS = frozenset(
     ("!", "*", "@", "#", "%", "/", "^", ","))
 
 
-def run(original_func: Callable, command: ValidCommand, *args, restrictions: ValidRestrictions = DEFAULT_CHECKS, **kwargs) -> Union[CompletedProcess, None]:
+def kwargs2config(kwargs: dict) -> ValidConfig:
+    """
+    Convert the kwargs to a config dict to be used by check().
+    Removes all SafeCommand kwargs from kwargs so kwargs can be passed to Popen.
+    """
+
+    def make_set(val: Union[Sequence[str], str, None]) -> ValidConfigVal:
+        if isinstance(val, (set, frozenset)): return val
+        elif isinstance(val, str): return {val}
+        elif isinstance(val, Sequence): return set(val)
+        elif val is None: return set()
+        else:
+            raise TypeError(f"Invalid type {type(val).__name__!r} cannot be used as a SafeCommand config value. Must be [Set[str]|Sequence[str]|str|None]")
+
+
+    # Config defaults to all DEFAULT_ prefixed variables in the globals
+    prefix = "DEFAULT_"
+    kslice = slice(len(prefix), None)
+    config = {k[kslice]: v for k, v in globals().items() if k.startswith(prefix)}
+    
+    # If the config kwarg is set update the config with it
+    if (config_kwarg := kwargs.pop("config", None)):
+        config.update(config_kwarg)
+
+    if "restrictions" in kwargs:
+        # restrictions kwarg takes precedence over the RESTRICTIONS config value
+        config["RESTRICTIONS"] = make_set(kwargs.pop("restrictions"))
+
+    for k in config:
+        kwarg_ending = k.lower()
+        if (set_vals := kwargs.pop(f"set_{kwarg_ending}", kwargs.pop(kwarg_ending, None))):
+            # set_<config_key>=vals or <config_key>=vals can be used as kwargs to set the config values
+            config[k] = make_set(set_vals)
+        
+        elif (add_vals := kwargs.pop(f"add_{kwarg_ending}", None)):
+            # add_<config_key>=vals can be used as kwargs to add to the config values
+            config[k] |= make_set(add_vals)
+
+        elif (remove_vals := kwargs.pop(f"remove_{kwarg_ending}", kwargs.pop(kwarg_ending.replace("banned_", "allow_"), None))):
+            # remove_<config_key>=vals or allow_<config_key_without_banned_prefix> can be used as kwargs to remove from the config values
+            config[k] -= make_set(remove_vals)
+
+    if (global_allow := kwargs.pop("allow", None)):
+        # allow=vals can be used to explicitly allow any string(s)
+        global_allow = make_set(global_allow)
+        for k in config:
+            config[k] -= global_allow
+    
+    return config
+
+
+def _check_then_call(original_func: Callable, command: ValidCommand, *args, force_shell=False, **kwargs) -> Any:
     # If there is a command and it passes the checks pass it the original function call
-    check(command, restrictions, **kwargs)
+    config = kwargs2config(kwargs)
+    check(command, config, Popen_kwargs=kwargs, force_shell=force_shell)
     return _call_original(original_func, command, *args, **kwargs)
 
-
-call = run
-
-
-def _call_original(original_func: Callable, command: ValidCommand, *args, **kwargs) -> Union[CompletedProcess, None]:
+def _call_original(original_func: Callable, command: ValidCommand, *args, **kwargs) -> Any:
     return original_func(command, *args, **kwargs)
 
 
+# Subprocess method wrappers
+def run(command: ValidCommand, *args, restrictions: ValidRestrictions = DEFAULT_RESTRICTIONS, **kwargs) -> subprocess.CompletedProcess:
+    return _check_then_call(subprocess.run, command, *args, restrictions=restrictions, **kwargs)
+
+def call(command: ValidCommand, *args, restrictions: ValidRestrictions = DEFAULT_RESTRICTIONS, **kwargs) -> int:
+    return _check_then_call(subprocess.call, command, *args, restrictions=restrictions, **kwargs)
+
+def check_call(command: ValidCommand, *args, restrictions: ValidRestrictions = DEFAULT_RESTRICTIONS, **kwargs) -> int:
+    return _check_then_call(subprocess.check_call, command, *args, restrictions=restrictions, **kwargs)
+
+def getstatusoutput(command: ValidCommand, *args, restrictions: ValidRestrictions = DEFAULT_RESTRICTIONS, **kwargs) -> Tuple[int, str]:
+    return _check_then_call(subprocess.getstatusoutput, command, *args, restrictions=restrictions, force_shell=True, **kwargs)
+
+def getoutput(command: ValidCommand, *args, restrictions: ValidRestrictions = DEFAULT_RESTRICTIONS, **kwargs) -> str:
+    return _check_then_call(subprocess.getoutput, command, *args, restrictions=restrictions, force_shell=True, **kwargs)
+
+def check_output(command: ValidCommand, *args, restrictions: ValidRestrictions = DEFAULT_RESTRICTIONS, **kwargs) -> str:
+    return _check_then_call(subprocess.check_output, command, *args, restrictions=restrictions, **kwargs)
+
+class Popen(subprocess.Popen):
+    def __init__(self, command: ValidCommand, *args, restrictions: ValidRestrictions = DEFAULT_RESTRICTIONS, **kwargs):
+        _check_then_call(super().__init__, command, *args, restrictions=restrictions, **kwargs)
+
+
+# SafeCommandRunner/SafeCommand class
+class SafeCommandRunner:
+    def __init__(self, restrictions: ValidRestrictions = DEFAULT_RESTRICTIONS, **kwargs) -> None:
+        self.config = kwargs2config({"restrictions": restrictions, **kwargs})
+        self.restrictions = self.config["RESTRICTIONS"]
+
+    def update_config(self, **kwargs) -> None:
+        keys_to_update = set(kwargs.keys()) # Store the keys before they are popped by kwargs2config
+        new_config = kwargs2config(kwargs)
+        for k in keys_to_update:
+            config_key = k.split("_", 1)[1].upper() if "_" in k else k.upper()
+            if config_key in self.config:
+                new_val = new_config[config_key]
+                self.config[config_key] = new_val
+                if config_key == "RESTRICTIONS":
+                    self.restrictions = new_val
+            elif config_key != 'ALLOW':
+                raise ValueError(f"Invalid SafeCommand config key: {k}")
+
+    def update_restrictions(self, restrictions: ValidRestrictions) -> None:
+        self.update_config(restrictions=restrictions)
+
+    def run(self, command: ValidCommand, *args, **kwargs) -> subprocess.CompletedProcess:
+        return run(command, *args, restrictions=self.restrictions, config=self.config, **kwargs)
+    
+    def call(self, command: ValidCommand, *args, **kwargs) -> int:
+        return call(command, *args, restrictions=self.restrictions, config=self.config, **kwargs)
+    
+    def check_call(self, command: ValidCommand, *args, **kwargs) -> int:
+        return check_call(command, *args, restrictions=self.restrictions, config=self.config, **kwargs)
+    
+    def getstatusoutput(self, command: ValidCommand, *args, **kwargs) -> Tuple[int, str]:
+        return getstatusoutput(command, *args, restrictions=self.restrictions, config=self.config, **kwargs)
+    
+    def getoutput(self, command: ValidCommand, *args, **kwargs) -> str:
+        return getoutput(command, *args, restrictions=self.restrictions, config=self.config, **kwargs)
+    
+    def check_output(self, command: ValidCommand, *args, **kwargs) -> str:
+        return check_output(command, *args, restrictions=self.restrictions, config=self.config, **kwargs)
+    
+    def Popen(self, command: ValidCommand, *args, **kwargs) -> subprocess.Popen:
+        return Popen(command, *args, restrictions=self.restrictions, config=self.config, **kwargs)
+    
+    def __str__(self) -> str:
+        return f"""SafeCommandRunner({", ".join(f'{k}=[{", ".join(v) if v else "NONE"}]' for k, v in self.config.items())})"""
+
+SafeCommand = SafeCommandRunner # Alias for SafeCommandRunner
+
+
+# Shell expansion and command parsing functions
 def _get_env_var_value(var: str, venv: Optional[dict] = None, default: Optional[str] = None) -> str:
     """
     Try to get the value of the environment variable var.
@@ -253,7 +381,11 @@ def _simple_shell_math(expression: Union[str, Iterator[str]], venv: dict, operat
     return int(value)
 
 
-def _shell_expand(command: str, venv: Optional[dict] = None) -> str:
+def _shell_expand(command: str, 
+                  venv: Optional[dict] = None,
+                  BANNED_SHELL_EXPANSION_OPERATORS: ValidConfigVal = DEFAULT_BANNED_SHELL_EXPANSION_OPERATORS,
+                  ALLOWED_SHELL_EXPANSION_OPERATORS: ValidConfigVal = DEFAULT_ALLOWED_SHELL_EXPANSION_OPERATORS
+                  ) -> str:
     """
     Expand shell variables and shell expansions in the command string.
     Implementation is based on Bash expansion rules: 
@@ -431,7 +563,12 @@ def _recursive_shlex_split(command: str) -> Iterator[str]:
             yield from _recursive_shlex_split(cmd_part)
 
 
-def _parse_command(command: ValidCommand, venv: Optional[dict] = None, shell: Optional[bool] = True) -> Tuple[str, List[str]]:
+def _parse_command(command: ValidCommand, 
+                   venv: Optional[dict] = None, 
+                   shell: Optional[bool] = True, 
+                   BANNED_SHELL_EXPANSION_OPERATORS: ValidConfigVal = DEFAULT_BANNED_SHELL_EXPANSION_OPERATORS,
+                   ALLOWED_SHELL_EXPANSION_OPERATORS: ValidConfigVal = DEFAULT_ALLOWED_SHELL_EXPANSION_OPERATORS
+                   ) -> Tuple[str, List[str]]:
     """
     Expands the shell exspansions in the command then parses the expanded command into a list of command parts.
     """
@@ -447,8 +584,11 @@ def _parse_command(command: ValidCommand, venv: Optional[dict] = None, shell: Op
         return ("", [])
 
     spaced_command = _space_redirection_operators(command_str)
-    expanded_command = _shell_expand(
-        spaced_command, venv) if shell else spaced_command
+    if shell:
+        expanded_command = _shell_expand(
+            spaced_command, venv, BANNED_SHELL_EXPANSION_OPERATORS, ALLOWED_SHELL_EXPANSION_OPERATORS)
+    else:
+        expanded_command = spaced_command
     parsed_command = list(_recursive_shlex_split(expanded_command))
     return expanded_command, parsed_command
 
@@ -523,19 +663,21 @@ def _resolve_paths_in_parsed_command(parsed_command: List[str], venv: Optional[d
 
     return abs_paths, abs_path_strings
 
-
-def check(command: ValidCommand, restrictions: ValidRestrictions, **kwargs) -> None:
-    if not restrictions:
+ # Restriction checks
+def check(command: ValidCommand, config: Dict[str, ValidConfigVal], Popen_kwargs: dict, force_shell: bool = False) -> None:
+    if not (RESTRICTIONS := config["RESTRICTIONS"]):
         # No restrictions no checks
         return None
 
     # venv is a copy to avoid modifying the original Popen kwargs or None to default to using os.environ when env is not set
-    venv = dict(**Popen_env) if (Popen_env := kwargs.get("env")) is not None else None
+    venv = dict(**Popen_env) if (Popen_env := Popen_kwargs.get("env")) is not None else None
 
     # Check if the executable is set by the Popen kwargs (either executable or shell)
-    # Executable takes precedence over shell. see subprocess.py line 1593
-    executable_path = _resolve_executable_path(kwargs.get("executable"), venv)
-    shell = executable_path.name in COMMON_SHELLS if executable_path else kwargs.get("shell")
+    # Executable takes precedence over shell. see subprocess.py line 1593.
+    # force_shell takes precedence over both and is used for subprocess.getstatusoutput and subprocess.getoutput 
+    # which both always run with shell=True but do not accept a shell kwarg
+    executable_path = _resolve_executable_path(Popen_kwargs.get("executable"), venv)
+    shell = force_shell or (executable_path.name in config["SHELLS"] if executable_path else Popen_kwargs.get("shell"))
 
     expanded_command, parsed_command = _parse_command(command, venv, shell)
     if not parsed_command:
@@ -549,33 +691,60 @@ def check(command: ValidCommand, restrictions: ValidRestrictions, **kwargs) -> N
     abs_paths, abs_path_strings = _resolve_paths_in_parsed_command(
         parsed_command, venv)
 
-    if "PREVENT_COMMAND_CHAINING" in restrictions:
-        check_multiple_commands(expanded_command, parsed_command)
+    if "PREVENT_COMMAND_CHAINING" in RESTRICTIONS:
+        check_multiple_commands(
+            expanded_command,
+            parsed_command,
+            config["BANNED_COMMAND_CHAINING_SEPARATORS"],
+            config["BANNED_COMMAND_AND_PROCESS_SUBSTITUTION_OPERATORS"],
+            config["BANNED_COMMAND_CHAINING_EXECUTABLES"],
+            config["SHELLS"]
+        )
 
-    if "PREVENT_ARGUMENTS_TARGETING_SENSITIVE_FILES" in restrictions:
-        check_sensitive_files(expanded_command, abs_path_strings)
+    if "PREVENT_ARGUMENTS_TARGETING_SENSITIVE_FILES" in RESTRICTIONS:
+        check_sensitive_files(
+            expanded_command,
+            abs_path_strings,
+            config["SENSITIVE_FILE_PATHS"]
+        )
 
-    if "PREVENT_COMMON_EXPLOIT_EXECUTABLES" in restrictions:
-        check_banned_executable(expanded_command, abs_path_strings)
+    if "PREVENT_COMMON_EXPLOIT_EXECUTABLES" in RESTRICTIONS:
+        check_banned_common_exploit_executables(
+            expanded_command, 
+            abs_path_strings,
+            config["BANNED_COMMON_EXPLOIT_EXECUTABLES"]    
+        )
 
-    prevent_uncommon_path_types = "PREVENT_UNCOMMON_PATH_TYPES" in restrictions
-    prevent_admin_owned_files = "PREVENT_ADMIN_OWNED_FILES" in restrictions
+    PREVENT_UNCOMMON_PATH_TYPES = "PREVENT_UNCOMMON_PATH_TYPES" in RESTRICTIONS
+    PREVENT_ADMIN_OWNED_FILES = "PREVENT_ADMIN_OWNED_FILES" in RESTRICTIONS
+    
+    # Only extract vals from config and loop through paths when checks are needed
+    if (PREVENT_UNCOMMON_PATH_TYPES or PREVENT_ADMIN_OWNED_FILES):   
+        BANNED_PATHTYPES = config["BANNED_PATHTYPES"]
+        BANNED_OWNERS = config["BANNED_OWNERS"]
+        BANNED_GROUPS = config["BANNED_GROUPS"]
 
-    for path in abs_paths:
-        # to avoid blocking the executable itself since most are symlinks to the actual executable
-        # and owned by root with group wheel or sudo
-        if path == executable_path:
-            continue
+        for path in abs_paths:
+            # to avoid blocking the executable itself since most are symlinks to the actual executable
+            # and owned by root with group wheel or sudo
+            if path == executable_path:
+                continue
 
-        if prevent_uncommon_path_types:
-            check_path_type(path)
+            if PREVENT_UNCOMMON_PATH_TYPES:
+                check_path_type(path, BANNED_PATHTYPES)
 
-        if prevent_admin_owned_files:
-            check_file_owner(path)
-            check_file_group(path)
+            if PREVENT_ADMIN_OWNED_FILES:
+                check_file_owner(path, BANNED_OWNERS)
+                check_file_group(path, BANNED_GROUPS)
 
 
-def check_multiple_commands(expanded_command: str, parsed_command: List[str]) -> None:
+def check_multiple_commands(expanded_command: str,
+                            parsed_command: List[str],
+                            BANNED_COMMAND_CHAINING_SEPARATORS: ValidConfigVal = DEFAULT_BANNED_COMMAND_CHAINING_SEPARATORS,
+                            BANNED_COMMAND_AND_PROCESS_SUBSTITUTION_OPERATORS: ValidConfigVal = DEFAULT_BANNED_COMMAND_AND_PROCESS_SUBSTITUTION_OPERATORS,
+                            BANNED_COMMAND_CHAINING_EXECUTABLES: ValidConfigVal = DEFAULT_BANNED_COMMAND_CHAINING_EXECUTABLES,
+                            SHELLS: ValidConfigVal = DEFAULT_SHELLS
+                            ) -> None:
     # Since shlex.split removes newlines from the command, it would not be present in the parsed_command and
     # must be checked for in the expanded command string
     if '\n' in expanded_command:
@@ -591,12 +760,15 @@ def check_multiple_commands(expanded_command: str, parsed_command: List[str]) ->
             raise SecurityException(
                 f"Multiple commands not allowed. Process substitution operators found.")
 
-        if cmd_part.strip() in BANNED_COMMAND_CHAINING_EXECUTABLES | COMMON_SHELLS:
+        if cmd_part.strip() in BANNED_COMMAND_CHAINING_EXECUTABLES | SHELLS:
             raise SecurityException(
                 f"Multiple commands not allowed. Executable {cmd_part} allows command chaining.")
 
 
-def check_sensitive_files(expanded_command: str, abs_path_strings: Set[str]) -> None:
+def check_sensitive_files(expanded_command: str,
+                          abs_path_strings: Set[str],
+                          SENSITIVE_FILE_PATHS: ValidConfigVal = DEFAULT_SENSITIVE_FILE_PATHS
+                          ) -> None:
     for sensitive_path in SENSITIVE_FILE_PATHS:
         # First check the absolute path strings for the sensitive files
         # Then handle edge cases when a sensitive file is part of a command but the path could not be resolved
@@ -609,8 +781,11 @@ def check_sensitive_files(expanded_command: str, abs_path_strings: Set[str]) -> 
                 f"Disallowed access to sensitive file: {sensitive_path}")
 
 
-def check_banned_executable(expanded_command: str, abs_path_strings: Set[str]) -> None:
-    for banned_executable in BANNED_EXECUTABLES:
+def check_banned_common_exploit_executables(expanded_command: str,
+                            abs_path_strings: Set[str],
+                            BANNED_COMMON_EXPLOIT_EXECUTABLES: ValidConfigVal = DEFAULT_BANNED_COMMON_EXPLOIT_EXECUTABLES
+                            ) -> None:
+    for banned_executable in BANNED_COMMON_EXPLOIT_EXECUTABLES:
         # First check the absolute path strings for the banned executables
         # Then handle edge cases when a banned executable is part of a command but the path could not be resolved
         if (
@@ -624,22 +799,75 @@ def check_banned_executable(expanded_command: str, abs_path_strings: Set[str]) -
                 f"Disallowed command: {banned_executable}")
 
 
-def check_path_type(path: Path) -> None:
+def check_path_type(path: Path,
+                    BANNED_PATHTYPES: ValidConfigVal = DEFAULT_BANNED_PATHTYPES
+                    ) -> None:
     for pathtype in BANNED_PATHTYPES:
         if getattr(path, f"is_{pathtype}")():
             raise SecurityException(
                 f"Disallowed access to path type {pathtype}: {path}")
 
 
-def check_file_owner(path: Path) -> None:
+def check_file_owner(path: Path,
+                     BANNED_OWNERS: ValidConfigVal = DEFAULT_BANNED_OWNERS
+                     ) -> None:
     owner = path.owner()
     if owner in BANNED_OWNERS:
         raise SecurityException(
             f"Disallowed access to file owned by {owner}: {path}")
 
 
-def check_file_group(path: Path) -> None:
+def check_file_group(path: Path,
+                     BANNED_GROUPS: ValidConfigVal = DEFAULT_BANNED_GROUPS
+                     ) -> None:
     group = path.group()
     if group in BANNED_GROUPS:
         raise SecurityException(
             f"Disallowed access to file owned by {group}: {path}")
+
+
+
+if __name__ == "__main__":
+    ### Example usage with module level functions
+    run("echo hello", shell=True)
+    call("/bin/ls") # Both allowed since commands do not trigger any restrictions
+
+    try:
+        # Blocked by the PREVENT_ARGUMENTS_TARGETING_SENSITIVE_FILES restriction
+        run("cat /etc/passwd", shell=True, restrictions={"PREVENT_ARGUMENTS_TARGETING_SENSITIVE_FILES"})
+    except SecurityException as e:
+        print(e)
+
+    try:
+        # Blocked since /secret/file is a sensitive file
+        run("cat /secret/file", shell=True,
+            restrictions={"PREVENT_ARGUMENTS_TARGETING_SENSITIVE_FILES"},
+            sensitive_file_paths={"/secret/file"}
+        )
+    except SecurityException as e:
+        print(e)       
+
+
+    ### Example usage with SafeCommandRunner/SafeCommand class
+    sc = SafeCommandRunner(
+        restrictions={"PREVENT_COMMON_EXPLOIT_EXECUTABLES", "PREVENT_ARGUMENTS_TARGETING_SENSITIVE_FILES"}, 
+        allow_common_exploit_executables={"nc"}
+    )
+    print(sc)
+    sc.run("nc -h", shell=True) # Allowed since nc is explicitly allowed in constructor
+    
+    sc.update_config(add_banned_common_exploit_executables={"nc"}) # Add nc to the banned executables
+    print(sc)
+    try:
+        sc.run("nc -h", shell=True) # Now blocked after updating the config
+    except SecurityException as e:
+        print(e)
+
+    try:
+        sc.run("cat /etc/passwd", shell=True) # Blocked by the PREVENT_ARGUMENTS_TARGETING_SENSITIVE_FILES restriction
+    except SecurityException as e:
+        print(e)
+
+    sc.update_restrictions(None) # Remove all restrictions. Note this is same as sc.update_config(restrictions=None)
+    print(sc)
+    sc.run("cat /etc/passwd", shell=True) # No restrictions so now allowed

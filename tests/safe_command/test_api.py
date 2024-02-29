@@ -4,6 +4,10 @@ import subprocess
 from security.exceptions import SecurityException
 from security import safe_command
 
+def _safe_command(original_func, command, *args, **kwargs):
+    """Equivalent to old API so I didnt have to change the tests."""
+    return getattr(safe_command, original_func.__name__)(command, *args, **kwargs)
+
 
 @pytest.mark.parametrize("original_func", [subprocess.run, subprocess.call])
 class TestSafeCommandApi:
@@ -17,19 +21,19 @@ class TestSafeCommandApi:
     def test_api_returns_same_result_lst_command(self, original_func):
         command = ["echo", "hello"]
         expected_result = original_func(command)
-        safe_api_result = safe_command.run(original_func, command)
+        safe_api_result = _safe_command(original_func, command)
         self._assert_equal_result(original_func, expected_result, safe_api_result)
 
     def test_api_returns_same_result_str_command_shell(self, original_func):
         command = "echo hello"
         expected_result = original_func(command, shell=True)
-        safe_api_result = safe_command.run(original_func, command, shell=True)
+        safe_api_result = _safe_command(original_func, command, shell=True)
         self._assert_equal_result(original_func, expected_result, safe_api_result)
 
     @pytest.mark.parametrize("command", ["", []])
     def test_empty_command_runs(self, command, original_func):
         with pytest.raises((PermissionError, IndexError)):
-            safe_command.run(original_func, command)
+            _safe_command(original_func, command)
 
     @pytest.mark.parametrize(
         "command",
@@ -44,12 +48,12 @@ class TestSafeCommandApi:
     )
     def test_blocks_sensitive_files(self, command, original_func):
         with pytest.raises(SecurityException) as err:
-            safe_command.run(original_func, command)
+            _safe_command(original_func, command)
         assert err.value.args[0].startswith("Disallowed access to sensitive file")
 
     @mock.patch("security.safe_command.api._call_original")
     def test_no_restrictions(self, mock_call_original, original_func):
-        safe_command.run(original_func, "cat /etc/passwd", restrictions=[])
+        _safe_command(original_func, "cat /etc/passwd", restrictions=[])
         mock_call_original.assert_called()
 
     @pytest.mark.parametrize(
@@ -67,7 +71,7 @@ class TestSafeCommandApi:
     )
     def test_blocks_command_chaining(self, command, original_func):
         with pytest.raises(SecurityException) as err:
-            safe_command.run(original_func, command)
+            _safe_command(original_func, command)
         assert err.value.args[0].startswith("Multiple commands not allowed")
 
     @pytest.mark.parametrize(
@@ -76,7 +80,7 @@ class TestSafeCommandApi:
     )
     def test_blocks_banned_exc(self, command, original_func):
         with pytest.raises(SecurityException) as err:
-            safe_command.run(
+            _safe_command(
                 original_func,
                 command,
                 restrictions=["PREVENT_COMMON_EXPLOIT_EXECUTABLES"],
